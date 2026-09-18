@@ -18,6 +18,7 @@ STRATIFY=none ./run_pipeline.sh        # library is one homogeneous set
 
 | Stage | Script | Output |
 | --- | --- | --- |
+| 0. Re-shard (optional) | `scripts/00_shard_input.py` | evenly sized input files |
 | 1. Fragment | `scripts/01_fragment.py` | `work/fragments.parquet`, `work/compound_fragments/` |
 | 2. Combine | `scripts/02_combine.py` | `work/combination_counts/size<k>/`, `work/combinations/size<k>/` |
 | 3. Enrich | `scripts/03_enrich.py` | `results/combination_enrichment_size<k>.parquet`, `results/top_combinations_size<k>.csv` |
@@ -43,7 +44,17 @@ one of them growing into a blob. With `--min-hac 1` the output is identical to
 Fragment SMILES keep their BRICS attachment labels (`[16*]c1ccccc1`), so the
 same ring joined through different chemistry stays a different fragment.
 
-A fragment's id is a 64-bit hash of its canonical SMILES. That matters at scale:
+A fragment's id is a 64-bit hash of its canonical SMILES, so **the same fragment
+gets the same `frag_id` in every input file, every shard and every run** - it is
+computed from the fragment alone, with no shared state. The short `frag_name`
+(`F000123`) is different: it is a cosmetic frequency rank assigned during the
+fold, so it depends on what else was in the run. Across a 50-file and a 5-file
+run over the same data, `frag_id` and `frag_smiles` agreed for all 4,483 shared
+fragments while `frag_name` agreed for none of them.
+
+**Join runs on `frag_id` or `frag_smiles`, never on `frag_name`** - and note that
+`combo_key` and `cluster_key` are built from names, so they too are only
+meaningful within one run. Hashing matters at scale for a second reason:
 numbering fragments in discovery order would need a pass over every compound
 before any id was known, and would renumber the whole dictionary each time a
 library was added. Content hashes let each worker write final output
@@ -178,6 +189,88 @@ interchangeable and pooling them is justified; well above 1 means the mode is
 merging combinations that genuinely differ. It rises steadily from
 `substituent` to `generic`, which is the quantitative statement that the looser
 modes buy their agreement by merging real differences.
+
+## Running stage 1 across a cluster
+
+Stage 1 is the only stage worth distributing, and it shards with no coordination
+between machines: fragment ids are content hashes, so two nodes fragmenting
+different files produce ids that agree and output that merges by concatenation.
+
+Ready-made job scripts live in `slurm/`:
+
+```bash
+python scripts/00_shard_input.py --input-dir data/BIG --out-dir data/BIG_sharded --rows 90000
+N_SHARDS=64 INPUT_DIR=data/BIG_sharded ./slurm/submit.sh
+```
+
+`submit.sh` sizes the array, clears stale output once, submits stage 1 as an
+array job and chains the rest behind `--dependency=afterok`, so scoring starts
+only if every shard succeeded. It trims the array if asked for more shards than
+there are files. Under the hood each task runs:
+
+```bash
+python scripts/01_fragment.py --shard $SLURM_ARRAY_TASK_ID/$N_SHARDS --workers $SLURM_CPUS_PER_TASK
+python scripts/01_fragment.py --reduce-only     # once every task has finished
+```
+
+Each task writes its own files and stops before the fold. `--reduce-only` builds
+the dictionary and the global summary from what they left. A sharded run is
+verified to produce byte-identical `fragments.parquet`, `compound_fragments/`
+and summary to a single run.
+
+### Resuming
+
+Stage 1 records each *input file* separately, writing `work/file_stats/<name>.json`
+only once both of that file's parquets are safely on disk. `--resume` skips
+files that have a record and two readable parquets, so an interrupted run picks
+up where it stopped:
+
+```bash
+RESUME=1 ./slurm/submit.sh                       # whole pipeline
+sbatch --array=7,23 ... slurm/fragment_array.sbatch   # or just the failed tasks
+python scripts/01_fragment.py --resume           # or locally
+```
+
+Because totals are folded from those per-file records rather than accumulated in
+memory, resuming cannot change the result: a run interrupted and resumed reports
+exactly the totals of a clean run. A file killed mid-write leaves a truncated
+parquet, which `--resume` detects by opening it, and redoes.
+
+`submit.sh` refuses to start when `work/` already holds stage 1 output, and tells
+you to pick `RESUME=1`, `CLEAN=1` or a different `WORK_DIR` - deleting several
+hours of fragmentation should not be the default for a script whose `WORK_DIR`
+has a default value.
+
+The split is balanced by row count (longest file first onto the least loaded
+shard), so array tasks finish together, and every task computes the same split
+independently. A shard never deletes previous output, since it cannot tell its
+siblings' work from stale files - clear `work/` yourself before re-running.
+
+Stage 0 evens the input out first: it streams a row group at a time, so a source
+file larger than memory still splits, and it balances pieces within each file
+rather than leaving a stub. Skip it if the delivery is already well sized.
+
+`slurm/fragment_array.sbatch` pins `OMP_NUM_THREADS=1` and friends. RDKit and
+numpy otherwise start their own thread pools that fight the process pool for
+cores, which can cost several-fold on a busy node.
+
+**How many workers?** Three limits, in the order they bite:
+
+- **One file is one task**, so speedup cannot exceed the file count. With 50
+  files it caps at 44.5x however many cores you allocate; efficiency at 128
+  workers is 35%. With ~3,750 files it stays at 91% out to 2,048 workers.
+- **Memory is per file, not per library**: ~370 MB per worker for an
+  89k-compound file (157 MB RDKit baseline plus ~236 MB per 100k compounds *in
+  that file*). Huge input files make workers expensive.
+- **The serial fold is negligible** - 1.9s of 675s, so Amdahl is not the limit.
+
+Which makes shard size the real tuning knob. Aim for ~80-100k compounds per
+input file, splitting big deliveries up front. Splitting is statistically free:
+because each file is a stratum, splitting one sub-library into 128 files turns 1
+stratum into 128, and the enrichments still match to Spearman 0.9998 - a stratum
+with no binders contributes nothing to Mantel-Haenszel, so losing it loses
+nothing. **Concatenating across sub-libraries is the destructive direction**:
+five per file inflates enrichments 6.4x, and one big file inflates them 38x.
 
 ## Scaling to hundreds of millions of compounds
 
