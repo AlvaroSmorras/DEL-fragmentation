@@ -26,6 +26,40 @@ from scipy.stats import chi2, hypergeom
 
 DEFAULT_ALPHA = 1.0
 
+# How the result tables are ordered.  Downstream stages take the first N rows of
+# what stage 3 wrote, so the ordering chosen here is what "top" means for the
+# rest of the pipeline.
+RANKINGS: dict[str, dict] = {
+    # Stratified lower bound: the default, and the only one that discounts a
+    # combination for resting on very few compounds.
+    "mh_lo95": {"by": ["enrichment_mh_lo95"], "fallback": "pooled_lo95"},
+    "pooled_lo95": {"by": ["enrichment_factor_lo95"]},
+    # Raw binders-per-non-binder, tie-broken by binder count so that the
+    # combinations with no non-binder at all - all of them tied at infinity -
+    # come out best-supported first.
+    "ratio": {"by": ["binder_per_nonbinder", "n_binder"]},
+    "mh": {"by": ["enrichment_mh"], "fallback": "pooled"},
+    "pooled": {"by": ["enrichment_factor"]},
+}
+DEFAULT_RANKING = "mh_lo95"
+
+
+def rank_columns(name: str, columns) -> list[str]:
+    """Columns to sort a result table by, following fallbacks when needed.
+
+    An unstratified run has no Mantel-Haenszel columns, so a ranking that asks
+    for them falls back to its pooled equivalent rather than failing.
+    """
+    if name not in RANKINGS:
+        raise KeyError(f"unknown ranking {name!r}; pick one of {sorted(RANKINGS)}")
+    spec = RANKINGS[name]
+    if all(column in columns for column in spec["by"]):
+        return list(spec["by"])
+    fallback = spec.get("fallback")
+    if fallback is None:
+        raise KeyError(f"ranking {name!r} needs {spec['by']}, which the table lacks")
+    return rank_columns(fallback, columns)
+
 # Sums that a Mantel-Haenszel estimate needs, accumulated over strata.
 MH_TERMS = ("mh_a", "mh_r", "mh_s", "mh_pr", "mh_psqr", "mh_qs", "mh_e", "mh_v")
 
@@ -139,6 +173,13 @@ def add_enrichment(
     out["n_total"] = out[binder_col] + out[nonbinder_col]
     out["frac_binder"] = n_bind / total_b
     out["frac_nonbinder"] = n_non / total_n
+
+    # The plain "how many binders per non-binder" ratio, before any correction.
+    # Dividing it by the library's own ratio gives exactly enrichment_factor
+    # below, so it is the same quantity read on a raw scale.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out["binder_per_nonbinder"] = n_bind / n_non
+    out.attrs["library_binder_per_nonbinder"] = total_b / total_n
 
     with np.errstate(divide="ignore", invalid="ignore"):
         out["enrichment_factor"] = out["frac_binder"] / out["frac_nonbinder"]

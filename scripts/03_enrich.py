@@ -42,8 +42,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.aggregate import choose_buckets, group_sum, total_rows  # noqa: E402
 from lib.combinations import combo_columns, combo_name  # noqa: E402
 from lib.enrichment import (  # noqa: E402
-    DEFAULT_ALPHA, MH_TERMS, add_enrichment, add_mantel_haenszel,
-    benjamini_hochberg, stratum_terms,
+    DEFAULT_ALPHA, DEFAULT_RANKING, MH_TERMS, RANKINGS, add_enrichment,
+    add_mantel_haenszel, benjamini_hochberg, rank_columns, stratum_terms,
 )
 from lib.io_utils import add_project_root_to_path, progress, read_summary, write_summary  # noqa: E402
 
@@ -120,7 +120,6 @@ def _score(size: int, files, args, stage1, stratify: bool) -> pd.DataFrame:
     if stratify:
         merged = add_mantel_haenszel(merged, alpha=args.alpha)
         merged["q_value_mh"] = benjamini_hochberg(merged["p_value_mh"].to_numpy())
-        rank_on = "enrichment_mh_lo95"
         merged = merged.drop(columns=list(MH_TERMS))
     else:
         from scipy.stats import hypergeom
@@ -131,9 +130,11 @@ def _score(size: int, files, args, stage1, stratify: bool) -> pd.DataFrame:
             merged["n_binder"] + merged["n_nonbinder"],
         )
         merged["q_value"] = benjamini_hochberg(merged["p_value"].to_numpy())
-        rank_on = "enrichment_factor_lo95"
 
+    rank_on = rank_columns(args.rank, merged.columns)
     merged = merged.sort_values(rank_on, ascending=False).reset_index(drop=True)
+    # Downstream stages take the first N rows, so record what that order means.
+    merged["rank_metric"] = args.rank
 
     needed = set()
     for col in keys:
@@ -165,7 +166,10 @@ def main() -> None:
     parser.add_argument("--stratify", choices=("file", "none"), default="file",
                         help="'file' scores within each input file and pools with Mantel-Haenszel; "
                              "'none' scores against the whole library (default: %(default)s)")
-    parser.add_argument("--top", type=int, default=500, help="rows written to the top CSV per size")
+    parser.add_argument("--rank", choices=sorted(RANKINGS), default=DEFAULT_RANKING,
+                        help="how the result tables are ordered; stages 4 and 5 take the "
+                             "first N rows, so this sets what 'top' means (default: %(default)s)")
+    parser.add_argument("--top", type=int, default=1500, help="rows written to the top CSV per size")
     args = parser.parse_args()
 
     stage1 = read_summary(args.work_dir / "summary_fragment.json")
@@ -175,6 +179,7 @@ def main() -> None:
 
     args.results_dir.mkdir(parents=True, exist_ok=True)
     summary = {
+        "rank": args.rank,
         "min_hac": stage1["min_hac"],
         "n_binders": stage1["n_binders"],
         "n_nonbinders": stage1["n_nonbinders"],
@@ -208,7 +213,10 @@ def main() -> None:
     frag_tested = (frags["n_binder"] + frags["n_nonbinder"]).to_numpy() >= args.min_count
     frags = add_enrichment(frags, stage1["n_binders"], stage1["n_nonbinders"],
                            alpha=args.alpha, tested=frag_tested)
-    frags = frags.sort_values("enrichment_factor_lo95", ascending=False).reset_index(drop=True)
+    frags = frags.sort_values(
+        rank_columns(args.rank, frags.columns), ascending=False
+    ).reset_index(drop=True)
+    frags["rank_metric"] = args.rank
     frags.to_parquet(args.results_dir / "fragment_enrichment.parquet", index=False)
 
     summary["elapsed_s"] = round(time.time() - started, 1)
