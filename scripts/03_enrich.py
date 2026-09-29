@@ -174,6 +174,12 @@ def main() -> None:
 
     stage1 = read_summary(args.work_dir / "summary_fragment.json")
     stage2 = read_summary(args.work_dir / "summary_combine.json")
+    if not stage1.get("labelled", True):
+        raise SystemExit(
+            f"{args.work_dir} was built from an unlabelled library (no activity column).\n"
+            "There is nothing to enrich against: stages 0-2 are the whole pipeline for a\n"
+            "catalogue. Use work/compound_fragments/ and work/combinations/ directly."
+        )
     stratify = args.stratify == "file"
     started = time.time()
 

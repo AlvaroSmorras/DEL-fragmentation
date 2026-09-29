@@ -48,6 +48,10 @@ from lib.io_utils import (  # noqa: E402
 
 add_project_root_to_path()
 
+# Stand-in activity for a compound whose label is unknown, distinct from the 0
+# that means "measured, does not bind".
+UNLABELLED = -1
+
 _OPTS: dict = {}
 
 
@@ -62,20 +66,33 @@ def _fragment_file(path_str: str) -> dict:
     out_dir = Path(_OPTS["out_dir"])
     counts_dir = Path(_OPTS["counts_dir"])
 
-    table = pq.read_table(path, columns=["CompoundIndex", "Smiles", "activity"])
+    # An unlabelled catalogue has no `activity`.  Fragmenting it is still
+    # useful - the fragments and combinations of each compound do not depend on
+    # knowing which ones bind - so the column is optional, and its absence is
+    # recorded rather than faked, so that nothing downstream can mistake an
+    # unlabelled compound for a measured non-binder.
+    available = set(pq.ParquetFile(path).schema_arrow.names)
+    labelled = "activity" in available
+    wanted = ["CompoundIndex", "Smiles"] + (["activity"] if labelled else [])
+    table = pq.read_table(path, columns=wanted)
     ids = table.column("CompoundIndex").to_pylist()
     smiles = table.column("Smiles").to_pylist()
-    activities = table.column("activity").to_pylist()
+    activities = table.column("activity").to_pylist() if labelled else [UNLABELLED] * len(ids)
 
     out_ids, out_act, out_frags, out_src, out_dst = [], [], [], [], []
     # fragment id -> [smiles, hac, attachments, compounds, binder compounds]
     counts: dict[int, list] = {}
+    # Memoising by SMILES only pays when a file repeats them.  An enumerated
+    # library or a catalogue has none, so the cache then holds one entry per
+    # compound and never hits - pure cost, and the largest single item in a
+    # worker's memory on a big file.
+    use_cache = _OPTS.get("cache_smiles", True)
     cache: dict[str, tuple | None] = {}
     failed: list[str] = []
     n_binders = n_nonbinders = 0
 
     for cid, smi, act in zip(ids, smiles, activities):
-        cached = cache.get(smi, False)
+        cached = cache.get(smi, False) if use_cache else False
         if cached is False:
             frag = fragment_smiles(smi, min_hac=min_hac)
             if frag is None:
@@ -83,15 +100,17 @@ def _fragment_file(path_str: str) -> dict:
             else:
                 frag_ids = tuple(fragment_id(s) for s in frag.smiles)
                 cached = (frag_ids, frag.smiles, frag.hac, frag.edges)
-            cache[smi] = cached
+            if use_cache:
+                cache[smi] = cached
         if cached is None:
             failed.append(cid)
             continue
 
         frag_ids, frag_smis, hacs, edges = cached
         is_binder = int(act) == 1
-        n_binders += is_binder
-        n_nonbinders += not is_binder
+        if labelled:
+            n_binders += is_binder
+            n_nonbinders += not is_binder
         for fid, frag_smi, hac in set(zip(frag_ids, frag_smis, hacs)):
             entry = counts.get(fid)
             if entry is None:
@@ -145,12 +164,19 @@ def _fragment_file(path_str: str) -> dict:
         (stats_dir / f"{path.stem}.failed.txt").write_text("\n".join(failed) + "\n")
     (stats_dir / f"{path.stem}.json").write_text(json.dumps({
         "stratum": path.stem,
+        "labelled": labelled,
         "n_compounds": len(out_ids),
         "n_binders": n_binders,
         "n_nonbinders": n_nonbinders,
         "n_unparsable_smiles": len(failed),
     }, sort_keys=True))
-    return {"file": path.name, "n_compounds": len(out_ids)}
+    return {
+        "file": path.name,
+        "labelled": labelled,
+        "n_compounds": len(out_ids),
+        "n_binders": n_binders,
+        "n_nonbinders": n_nonbinders,
+    }
 
 
 def _build_dictionary(counts_dir: Path, tmp_dir: Path) -> pd.DataFrame:
@@ -221,7 +247,7 @@ def _is_complete(work_dir: Path, stem: str) -> bool:
     return True
 
 
-def _collect_file_stats(work_dir: Path) -> tuple[dict, dict, int] | None:
+def _collect_file_stats(work_dir: Path) -> tuple[dict, dict, int, bool] | None:
     """Fold the per-file records into totals.
 
     These are per *input file*, not per shard or per run, so the totals come out
@@ -233,6 +259,7 @@ def _collect_file_stats(work_dir: Path) -> tuple[dict, dict, int] | None:
     totals = {"n_compounds": 0, "n_binders": 0, "n_nonbinders": 0}
     per_stratum: dict[str, dict] = {}
     n_failed = 0
+    labelled = True
     for path in paths:
         payload = json.loads(path.read_text())
         for key in totals:
@@ -241,8 +268,9 @@ def _collect_file_stats(work_dir: Path) -> tuple[dict, dict, int] | None:
             "n_binders": payload["n_binders"], "n_nonbinders": payload["n_nonbinders"],
         }
         n_failed += payload["n_unparsable_smiles"]
+        labelled &= bool(payload.get("labelled", True))
     print(f"folding {len(paths):,} per-file record(s)")
-    return totals, per_stratum, n_failed
+    return totals, per_stratum, n_failed, labelled
 
 
 def main() -> None:
@@ -254,6 +282,10 @@ def main() -> None:
                         help="minimum heavy atoms per fragment (default: %(default)s)")
     parser.add_argument("--workers", type=int, default=max(1, mp.cpu_count() - 1))
     parser.add_argument("--limit", type=int, default=0, help="only process the first N files (for testing)")
+    parser.add_argument("--no-smiles-cache", action="store_true",
+                        help="do not memoise fragmentation by SMILES. Set this for an "
+                             "enumerated library or a catalogue, where SMILES never repeat "
+                             "and the cache only costs memory")
     parser.add_argument("--shard", default=None, metavar="i/N",
                         help="fragment only shard i of N (0-based) and stop before the fold, "
                              "so array tasks can run on separate machines")
@@ -302,7 +334,8 @@ def main() -> None:
                 print("nothing left to fragment")
 
         opts = {"min_hac": args.min_hac, "out_dir": str(out_dir),
-                "counts_dir": str(counts_dir), "stats_dir": str(stats_dir)}
+                "counts_dir": str(counts_dir), "stats_dir": str(stats_dir),
+                "cache_smiles": not args.no_smiles_cache}
         label = f"shard {shard[0]}/{shard[1]}: " if shard else ""
         if files:
             print(f"{label}fragmenting {len(files)} file(s) with {args.workers} worker(s), "
@@ -327,7 +360,7 @@ def main() -> None:
     collected = _collect_file_stats(work_dir)
     if collected is None:
         raise SystemExit(f"no per-file records under {stats_dir}; nothing to fold")
-    totals, per_stratum, n_failed = collected
+    totals, per_stratum, n_failed, labelled = collected
     n_input_files = len(per_stratum)
     failures = sorted(stats_dir.glob("*.failed.txt"))
     if failures:
@@ -340,6 +373,7 @@ def main() -> None:
 
     summary = {
         "min_hac": args.min_hac,
+        "labelled": labelled,
         "input_dir": str(args.input_dir),
         "n_files": n_input_files,
         "n_unique_fragments": int(len(dictionary)),
@@ -349,10 +383,11 @@ def main() -> None:
         **totals,
     }
     write_summary(work_dir / "summary_fragment.json", summary)
+    label = (f"({totals['n_binders']:,} binders / {totals['n_nonbinders']:,} non-binders)"
+             if labelled else "(unlabelled - no activity column)")
     print(
         f"done in {summary['elapsed_s']}s: {totals['n_compounds']:,} compounds "
-        f"({totals['n_binders']:,} binders / {totals['n_nonbinders']:,} non-binders), "
-        f"{len(dictionary):,} unique fragments"
+        f"{label}, {len(dictionary):,} unique fragments"
     )
 
 

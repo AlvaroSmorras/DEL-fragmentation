@@ -38,8 +38,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.aggregate import choose_buckets, group_sum, total_rows  # noqa: E402
 from lib.combinations import combo_columns  # noqa: E402
 from lib.enrichment import (  # noqa: E402
-    DEFAULT_ALPHA, MH_TERMS, add_enrichment, add_mantel_haenszel,
-    benjamini_hochberg, stratum_terms,
+    DEFAULT_ALPHA, DEFAULT_RANKING, MH_TERMS, RANKINGS, add_enrichment,
+    add_mantel_haenszel, benjamini_hochberg, rank_columns, stratum_terms,
 )
 from lib.fragmentation import fragment_id  # noqa: E402
 from lib.io_utils import add_project_root_to_path, progress, read_summary, write_summary  # noqa: E402
@@ -97,7 +97,8 @@ def _approximate_counts(counts_dir: Path, mapping: pd.DataFrame, out_dir: Path) 
         grouped.to_parquet(out_dir / path.name, index=False)
 
 
-def _cluster_members(combos: pd.DataFrame, keys: dict[int, str], size: int) -> pd.DataFrame:
+def _cluster_members(combos: pd.DataFrame, keys: dict[int, str], size: int,
+                     ranking: str = DEFAULT_RANKING) -> pd.DataFrame:
     """Attach each combination to its cluster, and describe the clusters."""
     cols = combo_columns(size)
     members = combos.copy()
@@ -108,13 +109,13 @@ def _cluster_members(combos: pd.DataFrame, keys: dict[int, str], size: int) -> p
     members["cluster_key"] = cluster_keys
     members["cluster_id"] = [fragment_id(key) for key in cluster_keys]
 
-    rank = "enrichment_mh_lo95" if "enrichment_mh_lo95" in members else "enrichment_factor_lo95"
+    rank = rank_columns(ranking, members.columns)
     members = members.sort_values(rank, ascending=False)
     described = members.groupby("cluster_id", as_index=False).agg(
         cluster_key=("cluster_key", "first"),
         n_members=("combo_key", "size"),
         best_member=("combo_key", "first"),
-        best_member_enrichment_lo95=(rank, "first"),
+        best_member_enrichment_lo95=(rank[0], "first"),
         best_member_n_binder=("n_binder", "first"),
         members=("combo_key", lambda names: ";".join(names)),
         member_smiles=("frag_smiles", "first"),
@@ -131,7 +132,7 @@ def _score_size(size: int, args, stage1, keys: dict[int, str]) -> pd.DataFrame |
         return None
     cols = combo_columns(size)
 
-    members, described = _cluster_members(combos, keys, size)
+    members, described = _cluster_members(combos, keys, size, args.rank)
     print(f"  size {size}: {len(combos):,} combinations -> {len(described):,} clusters "
           f"({(described.n_members > 1).sum():,} with more than one member)")
 
@@ -188,13 +189,12 @@ def _score_size(size: int, args, stage1, keys: dict[int, str]) -> pd.DataFrame |
     if stratify:
         merged = add_mantel_haenszel(merged, alpha=args.alpha)
         merged["q_value_mh"] = benjamini_hochberg(merged["p_value_mh"].to_numpy())
-        rank = "enrichment_mh_lo95"
         merged = merged.drop(columns=list(MH_TERMS))
-    else:
-        rank = "enrichment_factor_lo95"
 
+    rank = rank_columns(args.rank, merged.columns)
     merged = merged.merge(described, on="cluster_id", how="left")
-    merged["pooling_gain"] = merged[rank] / merged["best_member_enrichment_lo95"]
+    merged["pooling_gain"] = merged[rank[0]] / merged["best_member_enrichment_lo95"]
+    merged["rank_metric"] = args.rank
     merged["combo_size"] = np.int8(size)
     return merged.sort_values(rank, ascending=False).reset_index(drop=True)
 
@@ -213,6 +213,9 @@ def main() -> None:
     parser.add_argument("--approximate", action="store_true",
                         help="sum member counts instead of recounting compounds")
     parser.add_argument("--workers", type=int, default=max(1, mp.cpu_count() - 1))
+    parser.add_argument("--rank", choices=sorted(RANKINGS), default=DEFAULT_RANKING,
+                        help="how clusters and their best members are ordered; match the "
+                             "value stage 3 was run with (default: %(default)s)")
     parser.add_argument("--top", type=int, default=500)
     args = parser.parse_args()
 
@@ -232,6 +235,7 @@ def main() -> None:
     print(f"  {len(set(keys.values())):,} distinct scaffold keys")
 
     summary = {"mode": args.mode, "max_strip": args.max_strip, "stratify": args.stratify,
+               "rank": args.rank,
                "approximate": args.approximate, "n_scaffold_keys": len(set(keys.values())),
                "sizes": {}}
 

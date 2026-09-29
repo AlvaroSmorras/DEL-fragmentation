@@ -33,6 +33,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -71,6 +72,11 @@ def _combine_file(path_str: str) -> dict:
     src_lists = table.column("edge_src").to_pylist()
     dst_lists = table.column("edge_dst").to_pylist()
 
+    # An unlabelled run carries the sentinel activity written by stage 1; there
+    # are no classes to count, so the tables report plain prevalence instead.
+    labelled = _OPTS["labelled"]
+    targets = _OPTS["targets"]
+
     # size -> combination tuple -> [binder compounds, non-binder compounds, example]
     counts: dict[int, dict[tuple, list]] = {size: {} for size in sizes}
     long_rows: dict[int, list] = {size: [] for size in sizes}
@@ -80,6 +86,8 @@ def _combine_file(path_str: str) -> dict:
     for cid, act, frag_ids, src, dst in zip(ids, activities, frag_id_lists, src_lists, dst_lists):
         edges = list(zip(src, dst))
         combos = combinations_for_compound(frag_ids, edges, sizes)
+        if targets is not None:
+            combos = [combo for combo in combos if combo in targets]
         if not combos:
             continue
         n_compounds_with_combo += 1
@@ -87,14 +95,15 @@ def _combine_file(path_str: str) -> dict:
         for combo in combos:
             bucket = counts[len(combo)]
             entry = bucket.get(combo)
+            keep_example = is_binder or not labelled
             if entry is None:
                 # An example compound is only useful for a combination a binder
                 # actually carries, and carrying the string is the expensive part.
-                bucket[combo] = [int(is_binder), int(not is_binder), cid if is_binder else None]
+                bucket[combo] = [int(is_binder), int(not is_binder), cid if keep_example else None]
             else:
                 entry[0] += is_binder
                 entry[1] += not is_binder
-                if is_binder and entry[2] is None:
+                if keep_example and entry[2] is None:
                     entry[2] = cid
             if long_root is not None:
                 long_rows[len(combo)].append((cid, int(act), combo))
@@ -106,16 +115,23 @@ def _combine_file(path_str: str) -> dict:
         bucket = counts[size]
         keys = list(bucket)
         n_unique += len(keys)
-        _write(
-            {col: [key[i] for key in keys] for i, col in enumerate(columns)},
-            columns,
-            {
+        if labelled:
+            extra = {
                 "n_binder": pa.array([bucket[k][0] for k in keys], pa.int64()),
                 "n_nonbinder": pa.array([bucket[k][1] for k in keys], pa.int64()),
-                "example_compound": pa.array([bucket[k][2] for k in keys], pa.string()),
-            },
-            counts_root / f"size{size}",
-            path.name,
+            }
+        else:
+            # No classes to split, so the useful number is how many compounds of
+            # the catalogue carry the combination at all.
+            extra = {
+                "n_compounds": pa.array(
+                    [bucket[k][0] + bucket[k][1] for k in keys], pa.int64()
+                ),
+            }
+        extra["example_compound"] = pa.array([bucket[k][2] for k in keys], pa.string())
+        _write(
+            {col: [key[i] for key in keys] for i, col in enumerate(columns)},
+            columns, extra, counts_root / f"size{size}", path.name,
         )
         if long_root is not None:
             rows = long_rows[size]
@@ -145,6 +161,10 @@ def main() -> None:
     parser.add_argument("--sizes", default="2",
                         help="comma-separated combination sizes, e.g. '2' or '2,3' (default: %(default)s)")
     parser.add_argument("--workers", type=int, default=max(1, mp.cpu_count() - 1))
+    parser.add_argument("--target-combos", type=Path, default=None,
+                        help="parquet of frag_0/frag_1 columns; keep only these combinations. "
+                             "Built by scripts/build_target_combos.py, and what makes searching "
+                             "a catalogue for a DEL's hits affordable")
     parser.add_argument("--no-long-table", action="store_true",
                         help="only write the aggregated counts, not the per-compound table; "
                              "worth setting on very large libraries")
@@ -162,9 +182,25 @@ def main() -> None:
         if directory is not None and directory.exists():
             shutil.rmtree(directory)
 
+    stage1 = read_summary(work_dir / "summary_fragment.json")
+    labelled = bool(stage1.get("labelled", True))
+    if not labelled:
+        print("stage 1 output is unlabelled; counting prevalence instead of binders")
+
+    targets = None
+    if args.target_combos:
+        wanted = pd.read_parquet(args.target_combos)
+        keys = [column for column in wanted.columns if column.startswith("frag_")]
+        targets = set(map(tuple, wanted[keys].to_numpy().tolist()))
+        print(f"restricting to {len(targets):,} target combination(s) from {args.target_combos}")
+        if len(targets) > 20_000_000:
+            print("  warning: a target set this large costs several GB per worker")
+
     started = time.time()
     opts = {
         "sizes": sizes,
+        "labelled": labelled,
+        "targets": targets,
         "counts_root": str(counts_root),
         "long_root": None if long_root is None else str(long_root),
     }
@@ -176,8 +212,9 @@ def main() -> None:
             for key in ("n_compounds", "n_compounds_with_combo", "n_combination_rows", "n_unique_in_file"):
                 totals[key] += result[key]
 
-    stage1 = read_summary(work_dir / "summary_fragment.json")
     summary = {
+        "labelled": labelled,
+        "n_target_combos": None if targets is None else len(targets),
         "sizes": list(sizes),
         "min_hac": stage1["min_hac"],
         "n_files": len(files),
