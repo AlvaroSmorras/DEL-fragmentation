@@ -18,13 +18,15 @@ STRATIFY=none ./run_pipeline.sh        # library is one homogeneous set
 
 | Stage | Script | Output |
 | --- | --- | --- |
-| 0. Re-shard (optional) | `scripts/00_shard_input.py` | evenly sized input files |
 | 1. Fragment | `scripts/01_fragment.py` | `work/fragments.parquet`, `work/compound_fragments/` |
 | 2. Combine | `scripts/02_combine.py` | `work/combination_counts/size<k>/`, `work/combinations/size<k>/` |
 | 3. Enrich | `scripts/03_enrich.py` | `results/combination_enrichment_size<k>.parquet`, `results/top_combinations_size<k>.csv` |
 | 4. Inspect | `scripts/04_inspect.py` | `results/top_combinations_smiles_size<k>.csv` |
 | 5. Cluster | `scripts/05_cluster.py` | `results/cluster_enrichment_size<k>.parquet`, `results/top_clusters_size<k>.csv` |
 | 6. Validate | `scripts/06_validate_clusters.py` | printed report for choosing the clustering mode |
+| 7. Catalogue hits | `scripts/07_catalogue_hits.py` | `results/catalogue/` - enriched fragments/combinations found in a catalogue, and its compounds carrying them |
+| 8. Chemical space | `scripts/08_embed_space.py` | `results/embedding/` - ECFP4 PCA/UMAP maps of DEL vs catalogue |
+| 9. Report | `scripts/09_report.py` | `results/catalogue/report.html` - structures of the shared enriched units, with the maps |
 
 Stage 1 is the only expensive stage. Changing `--sizes`, `--min-binder`,
 `--stratify` or `--alpha` only requires re-running stages 2-5.
@@ -44,17 +46,7 @@ one of them growing into a blob. With `--min-hac 1` the output is identical to
 Fragment SMILES keep their BRICS attachment labels (`[16*]c1ccccc1`), so the
 same ring joined through different chemistry stays a different fragment.
 
-A fragment's id is a 64-bit hash of its canonical SMILES, so **the same fragment
-gets the same `frag_id` in every input file, every shard and every run** - it is
-computed from the fragment alone, with no shared state. The short `frag_name`
-(`F000123`) is different: it is a cosmetic frequency rank assigned during the
-fold, so it depends on what else was in the run. Across a 50-file and a 5-file
-run over the same data, `frag_id` and `frag_smiles` agreed for all 4,483 shared
-fragments while `frag_name` agreed for none of them.
-
-**Join runs on `frag_id` or `frag_smiles`, never on `frag_name`** - and note that
-`combo_key` and `cluster_key` are built from names, so they too are only
-meaningful within one run. Hashing matters at scale for a second reason:
+A fragment's id is a 64-bit hash of its canonical SMILES. That matters at scale:
 numbering fragments in discovery order would need a pass over every compound
 before any id was known, and would renumber the whole dictionary each time a
 library was added. Content hashes let each worker write final output
@@ -190,87 +182,71 @@ merging combinations that genuinely differ. It rises steadily from
 `substituent` to `generic`, which is the quantitative statement that the looser
 modes buy their agreement by merging real differences.
 
-## Running stage 1 across a cluster
+## Catalogue stages (7-8)
 
-Stage 1 is the only stage worth distributing, and it shards with no coordination
-between machines: fragment ids are content hashes, so two nodes fragmenting
-different files produce ids that agree and output that merges by concatenation.
-
-Ready-made job scripts live in `slurm/`:
-
-```bash
-python scripts/00_shard_input.py --input-dir data/BIG --out-dir data/BIG_sharded --rows 90000
-N_SHARDS=64 INPUT_DIR=data/BIG_sharded ./slurm/submit.sh
-```
-
-`submit.sh` sizes the array, clears stale output once, submits stage 1 as an
-array job and chains the rest behind `--dependency=afterok`, so scoring starts
-only if every shard succeeded. It trims the array if asked for more shards than
-there are files. Under the hood each task runs:
+Stages 7 and 8 compare a labelled DEL run (`work_full/`, `results_full/`) with
+an unlabelled catalogue run (`work_catalogue/`, Enamine REAL lead-like, built
+by `slurm/submit_catalogue.sh` with the target list from
+`scripts/build_target_combos.py`).
 
 ```bash
-python scripts/01_fragment.py --shard $SLURM_ARRAY_TASK_ID/$N_SHARDS --workers $SLURM_CPUS_PER_TASK
-python scripts/01_fragment.py --reduce-only     # once every task has finished
+# ratio ranking - the one for prospective transfer to a catalogue
+RANK=ratio DEL_RESULTS=results_binder_ratio OUT_DIR=results_binder_ratio/catalogue \
+    MAX_PER_FRAGMENT=0 sbatch --account naiss2025-3-21-cpu slurm/catalogue_hits.sbatch
+DEL_RESULTS=results_binder_ratio OUT_DIR=results_binder_ratio/embedding \
+    sbatch --account naiss2025-3-21-cpu slurm/embed_space.sbatch
+python scripts/09_report.py --results-dir results_binder_ratio    # env: fragviz
+
+# Mantel-Haenszel ranking, over results_full/
+sbatch --account naiss2025-3-21-cpu slurm/catalogue_hits.sbatch
+sbatch --account naiss2025-3-21-cpu slurm/embed_space.sbatch
 ```
 
-Each task writes its own files and stops before the fold. `--reduce-only` builds
-the dictionary and the global summary from what they left. A sharded run is
-verified to produce byte-identical `fragments.parquet`, `compound_fragments/`
-and summary to a single run.
+**Which ranking.** `--rank ratio` keeps a unit when `binder_per_nonbinder >=
+--min-ratio` (default 0.01, about 20x the library's base rate of 0.0005) on at
+least `--min-binder` binders. It is the ranking to transfer to a catalogue: it
+is the observed binder rate of compounds carrying the unit, which is what a
+prospective prediction is about, and it needs a run scored by
+`scripts/03b_enrich_by_ratio.py`. `--rank mh` (the default) instead uses the
+stratified test, which answers whether the signal is real rather than how large
+it is. The ratio ignores stratum and gives thin evidence no discount, so the
+`--min-binder` floor is doing real work - see the caveat in
+`03b_enrich_by_ratio.py`.
 
-### Resuming
+**Stage 7** matches on fragment ids. Ids are hashes of the canonical fragment
+SMILES including the BRICS attachment labels, so a match is exact: same
+fragment, attached through the same chemistry. "Enriched" means
+`q < --alpha` (0.05) and the 95% lower bound `> --min-lo95` (1); combinations
+use the Mantel-Haenszel columns, single fragments only have pooled ones. Writes
+to `results_full/catalogue/`:
 
-Stage 1 records each *input file* separately, writing `work/file_stats/<name>.json`
-only once both of that file's parquets are safely on disk. `--resume` skips
-files that have a record and two readable parquets, so an interrupted run picks
-up where it stopped:
+| File | Content |
+| --- | --- |
+| `fragment_in_catalogue.parquet`, `combination_in_catalogue.parquet` | every scored DEL unit + `n_catalogue`, `in_catalogue`, `enriched` |
+| `enriched_*_in_catalogue.csv` | the enriched subset, sorted by lower bound |
+| `catalogue_compounds_enriched_combinations.parquet` | **every** catalogue compound carrying an enriched combination, with SMILES and the combination's DEL statistics |
+| `catalogue_compounds_enriched_fragments.parquet` | up to `--max-per-fragment` catalogue compounds per enriched fragment, spread over files (`--max-per-fragment 0` keeps every one); exact counts are in `fragment_in_catalogue.parquet` |
+| `enamine_compounds_with_enriched_fragment.{parquet,csv}`, `enamine_compounds_with_enriched_combination.{parquet,csv}` | the buying list: compound id, compound SMILES, the unit and its SMILES, then the DEL evidence. The CSV is skipped above 5M rows; the parquet always holds every row |
 
-```bash
-RESUME=1 ./slurm/submit.sh                       # whole pipeline
-sbatch --array=7,23 ... slurm/fragment_array.sbatch   # or just the failed tasks
-python scripts/01_fragment.py --resume           # or locally
-```
+Re-thresholding needs no rerun of the compound pass if you only tighten: filter
+the compound tables on their `enrichment_*_lo95` / `q_value*` columns.
 
-Because totals are folded from those per-file records rather than accumulated in
-memory, resuming cannot change the result: a run interrupted and resumed reports
-exactly the totals of a clean run. A file killed mid-write leaves a truncated
-parquet, which `--resume` detects by opening it, and redoes.
+**Stage 8** samples 50k distinct fragments (and 50k distinct contiguous pairs,
+enumerated from compounds drawn across 60 files) per library, adds every
+enriched DEL unit, featurises with ECFP4 (radius 2, 2048 bits; attachment
+points kept as unlabelled dummy atoms) and projects with PCA (fitted on the
+background only) and UMAP (Jaccard). The catalogue run only stored the DEL
+target pairs, so its combination background has to be sampled from
+`compound_fragments/`. A pair is rebuilt as one molecule by bonding a
+BRICS-compatible pair of attachment points; when a fragment has several
+compatible ones the choice can differ from the real compound (76% of the
+stage 4 top 500 rebuild exactly, the rest differ only in attachment site). The
+third panel colours by whichever ranking stage 7 used.
 
-`submit.sh` refuses to start when `work/` already holds stage 1 output, and tells
-you to pick `RESUME=1`, `CLEAN=1` or a different `WORK_DIR` - deleting several
-hours of fragmentation should not be the default for a script whose `WORK_DIR`
-has a default value.
-
-The split is balanced by row count (longest file first onto the least loaded
-shard), so array tasks finish together, and every task computes the same split
-independently. A shard never deletes previous output, since it cannot tell its
-siblings' work from stale files - clear `work/` yourself before re-running.
-
-Stage 0 evens the input out first: it streams a row group at a time, so a source
-file larger than memory still splits, and it balances pieces within each file
-rather than leaving a stub. Skip it if the delivery is already well sized.
-
-`slurm/fragment_array.sbatch` pins `OMP_NUM_THREADS=1` and friends. RDKit and
-numpy otherwise start their own thread pools that fight the process pool for
-cores, which can cost several-fold on a busy node.
-
-**How many workers?** Three limits, in the order they bite:
-
-- **One file is one task**, so speedup cannot exceed the file count. With 50
-  files it caps at 44.5x however many cores you allocate; efficiency at 128
-  workers is 35%. With ~3,750 files it stays at 91% out to 2,048 workers.
-- **Memory is per file, not per library**: ~370 MB per worker for an
-  89k-compound file (157 MB RDKit baseline plus ~236 MB per 100k compounds *in
-  that file*). Huge input files make workers expensive.
-- **The serial fold is negligible** - 1.9s of 675s, so Amdahl is not the limit.
-
-Which makes shard size the real tuning knob. Aim for ~80-100k compounds per
-input file, splitting big deliveries up front. Splitting is statistically free:
-because each file is a stratum, splitting one sub-library into 128 files turns 1
-stratum into 128, and the enrichments still match to Spearman 0.9998 - a stratum
-with no binders contributes nothing to Mantel-Haenszel, so losing it loses
-nothing. **Concatenating across sub-libraries is the destructive direction**:
-five per file inflates enrichments 6.4x, and one big file inflates them 38x.
+**Stage 9** turns all of it into one self-contained `report.html`: the counts,
+every shared enriched fragment and pair drawn as a structure with its DEL
+evidence and catalogue count, and the stage 8 maps inlined. It needs `fragviz`
+for RDKit's drawing code and takes a few seconds.
 
 ## Scaling to hundreds of millions of compounds
 
@@ -332,6 +308,6 @@ lib/combinations.py    connected-subgraph enumeration
 lib/aggregate.py       hash-partitioned group-and-sum for out-of-core reduces
 lib/enrichment.py      pooled and Mantel-Haenszel enrichment, BH correction
 lib/scaffolds.py       fragment normalisation for clustering
-scripts/0{1..6}_*.py   the pipeline stages
+scripts/0{1..9}_*.py   the pipeline stages (7-9: catalogue comparison and report)
 tests/test_pipeline.py pytest suite (python -m pytest tests/ -q)
 ```

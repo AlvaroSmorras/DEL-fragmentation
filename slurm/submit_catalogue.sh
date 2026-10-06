@@ -34,9 +34,9 @@ if [ -n "${SLURM_JOB_ID:-}" ]; then
 fi
 
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-ACCOUNT="${ACCOUNT:-naiss2026-3-421-cpu}"
+ACCOUNT="${ACCOUNT:-naiss2025-3-21-cpu}"
 PARTITION="${PARTITION:-}"
-INPUT_DIR="${INPUT_DIR:-data/catalogue_sharded}"
+INPUT_DIR="${INPUT_DIR:-data/Enamine_ll/sharded/}"
 WORK_DIR="${WORK_DIR:-work_catalogue}"
 TARGET_COMBOS="${TARGET_COMBOS:-targets.parquet}"
 MIN_HAC="${MIN_HAC:-6}"
