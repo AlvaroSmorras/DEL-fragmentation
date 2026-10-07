@@ -26,7 +26,7 @@ STRATIFY=none ./run_pipeline.sh        # library is one homogeneous set
 | 6. Validate | `scripts/06_validate_clusters.py` | printed report for choosing the clustering mode |
 | 7. Catalogue hits | `scripts/07_catalogue_hits.py` | `results/catalogue/` - enriched fragments/combinations found in a catalogue, and its compounds carrying them |
 | 8. Chemical space | `scripts/08_embed_space.py` | `results/embedding/` - ECFP4 PCA/UMAP maps of DEL vs catalogue |
-| 9. Report | `scripts/09_report.py` | `results/catalogue/report.html` - structures of the shared enriched units, with the maps |
+| 9. Report | `scripts/09_report.py` | `results/catalogue/report.{html,pdf}` - structures of the shared enriched units, with the maps |
 
 Stage 1 is the only expensive stage. Changing `--sizes`, `--min-binder`,
 `--stratify` or `--alpha` only requires re-running stages 2-5.
@@ -231,11 +231,11 @@ to `results_full/catalogue/`:
 Re-thresholding needs no rerun of the compound pass if you only tighten: filter
 the compound tables on their `enrichment_*_lo95` / `q_value*` columns.
 
-**Stage 8** samples 50k distinct fragments (and 50k distinct contiguous pairs,
+**Stage 8** samples 500k distinct fragments (and 500k distinct contiguous pairs,
 enumerated from compounds drawn across 60 files) per library, adds every
-enriched DEL unit, featurises with ECFP4 (radius 2, 2048 bits; attachment
+enriched DEL unit, featurises with ECFP4 (radius 2, 1024 bits; attachment
 points kept as unlabelled dummy atoms) and projects with PCA (fitted on the
-background only) and UMAP (Jaccard). The catalogue run only stored the DEL
+background only) and UMAP (Jaccard on the bits). The catalogue run only stored the DEL
 target pairs, so its combination background has to be sampled from
 `compound_fragments/`. A pair is rebuilt as one molecule by bonding a
 BRICS-compatible pair of attachment points; when a fragment has several
@@ -243,10 +243,77 @@ compatible ones the choice can differ from the real compound (76% of the
 stage 4 top 500 rebuild exactly, the rest differ only in attachment site). The
 third panel colours by whichever ranking stage 7 used.
 
-**Stage 9** turns all of it into one self-contained `report.html`: the counts,
-every shared enriched fragment and pair drawn as a structure with its DEL
-evidence and catalogue count, and the stage 8 maps inlined. It needs `fragviz`
-for RDKit's drawing code and takes a few seconds.
+### Why the PCA is not on the fingerprint
+
+An ECFP4 PCA of this data is close to unreadable, and not because the sample is
+small. Fitting it on two *disjoint* samples of the same size and measuring the
+angle between the resulting PC1-PC2 planes:
+
+| background per library | PC1+PC2 variance (DEL / Enamine) | plane angle between samples |
+| --- | --- | --- |
+| 2,000 | 14.2% / 10.4% | 72° / 74° |
+| 10,000 | 11.7% / 8.4% | 57° / 60° |
+| 50,000 | 10.2% / 7.2% | 41° / 57° |
+| 200,000 | 12.5% / 6.4% | 51° / 41° |
+
+Two components never hold more than about 13%, 50 components reach only 37-45%,
+and the variance *falls* as the sample grows, because a larger sample exposes
+more real diversity. The plane stays 40-57° from its own replicate even at
+200k: the eigenvalues are near-degenerate, so the leading plane rotates freely.
+No sample size fixes either problem - they are properties of sparse binary
+substructure bits.
+
+The same molecules through eleven standardised physicochemical descriptors
+(`MolWt`, `cLogP`, `TPSA`, `HBD`, `HBA`, `RotBonds`, `Rings`, `AromaticRings`,
+`Fsp3`, `HeavyAtoms`, `Heteroatoms`) give **59-75%** in two components with the
+plane stable to **11-25°**, and axes that read as size (PC1) and polarity
+(PC2) - `summary_embedding.json` records the loadings. That is the default.
+`--pca-space ecfp` restores the fingerprint PCA. UMAP is on ECFP4 either way:
+it uses Jaccard distance directly and never touches these axes, so none of this
+applies to it.
+
+### How big a background sample
+
+Variance is not the sample-size question - coverage is. Median Tanimoto from a
+held-out fragment to its nearest neighbour in the background:
+
+| background per library | DEL | Enamine | Enamine, fraction with a neighbour above 0.6 |
+| --- | --- | --- | --- |
+| 10,000 | 0.49 | 0.39 | 3% |
+| 50,000 | 0.60 | 0.46 | 12% |
+| 200,000 | 0.67 | 0.55 | 35% |
+
+Still climbing at 200k - even 500k distinct fragments is 2% of Enamine's 23M -
+so the backdrop understates how much space the catalogue fills, and sparse
+regions look emptier than they are. Hence the 500k default, which costs about
+15 minutes on one node. This affects only the background: **every enriched unit
+is always drawn, never sampled**, so the overlay and anything read off it are
+unaffected by the sample size.
+
+The two libraries are shuffled together before the scatter, so they interleave
+in z. One `scatter` call draws in row order, so without that the library
+concatenated last would sit on top everywhere and look like the denser one.
+Marker size and alpha scale with the sample, since a million points at the size
+that suited 50k is a solid blob.
+
+**Stage 9** turns all of it into a `report.html` that inlines everything (so it
+can be mailed on its own) and a `report.pdf` of the same content paged for
+print: the counts, every shared enriched fragment and pair drawn as a structure
+with its DEL evidence and catalogue count, and the stage 8 maps. Five
+structures per row; the PDF is A4 landscape, 20 per page. `--no-pdf` skips the
+PDF. It needs `fragviz` for RDKit's drawing code and takes a few seconds.
+
+Cards carry raw `binders / non-binders` rather than their quotient - a ratio
+alone hides whether it came from 400 binders or from 5 - plus the enrichment
+lower bound on an `--rank mh` run, where that is not just the counts restated.
+
+`--min-enrichment` draws only units scoring at least that much on whichever
+ranking stage 7 used, so `--min-enrichment 1` on a ratio run keeps those whose
+binders outnumber their non-binders. It filters the report, never the tables.
+
+```bash
+python scripts/09_report.py --results-dir results_binder_ratio --min-enrichment 1
+```
 
 ## Scaling to hundreds of millions of compounds
 
