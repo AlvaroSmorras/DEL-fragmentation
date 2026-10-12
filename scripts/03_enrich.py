@@ -187,6 +187,7 @@ def main() -> None:
     summary = {
         "rank": args.rank,
         "min_hac": stage1["min_hac"],
+        "selector": stage1.get("selector", "greedy"),
         "n_binders": stage1["n_binders"],
         "n_nonbinders": stage1["n_nonbinders"],
         "stratify": args.stratify,

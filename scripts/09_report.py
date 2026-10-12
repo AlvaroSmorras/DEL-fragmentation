@@ -34,6 +34,7 @@ import base64
 import html
 import io
 import json
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,6 +46,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lib.io_utils import add_project_root_to_path  # noqa: E402
+from lib.scaffolds import MODES, scaffold_key  # noqa: E402
 
 add_project_root_to_path()
 RDLogger.DisableLog("rdApp.*")
@@ -64,6 +66,8 @@ class Card:
     title: str
     mol: Chem.Mol
     stats: list[tuple[str, str]]
+    cluster_id: int = 0      # 1-based, in the order clusters are drawn
+    cluster_size: int = 1    # members of that cluster among the drawn units
 
 
 def _load_joiner():
@@ -94,8 +98,46 @@ def rank_label(column: str) -> str:
     return "binders per non-binder" if column == "binder_per_nonbinder" else "enrichment lower bound"
 
 
+def _cluster_key(frag_smiles: str, mode: str) -> str:
+    """The key a drawn unit groups under.
+
+    A combination's SMILES is its two fragments separated by a dot, so it keys
+    on its members' keys as a sorted pair - the same rule stage 5 clusters
+    combinations by, rather than normalising the merged molecule.
+    """
+    parts = frag_smiles.split(".")
+    return "|".join(sorted(scaffold_key(part, mode) for part in parts))
+
+
+def order_by_cluster(frame: pd.DataFrame, rank_col: str, mode: str) -> pd.DataFrame:
+    """Group near-identical units together, best cluster first.
+
+    Ranking alone scatters one chemical series down the page, since its members
+    differ in enrichment even when they are the same signal measured several
+    times. Clusters are ordered by their best member, so the strongest still
+    leads, but a member that ranks poorly is drawn beside its siblings instead
+    of far below them.
+    """
+    frame = frame.copy()
+    if mode == "none" or frame.empty:
+        frame["cluster_id"] = range(1, len(frame) + 1)
+        frame["cluster_size"] = 1
+        return frame
+
+    frame["cluster_key"] = [_cluster_key(smiles, mode) for smiles in frame["frag_smiles"]]
+    # inf sorts fine here; it only has to order clusters, never be printed.
+    best = frame.groupby("cluster_key")[rank_col].max().rename("cluster_best")
+    size = frame.groupby("cluster_key")[rank_col].size().rename("cluster_size")
+    frame = frame.join(best, on="cluster_key").join(size, on="cluster_key")
+    frame = frame.sort_values(["cluster_best", "cluster_key", rank_col],
+                              ascending=[False, True, False], kind="stable")
+    order = {key: i for i, key in enumerate(frame["cluster_key"].drop_duplicates(), start=1)}
+    frame["cluster_id"] = frame["cluster_key"].map(order)
+    return frame
+
+
 def build_cards(frame: pd.DataFrame, rank_col: str, top: int, prepare=None) -> list[Card]:
-    """Rows -> drawable cards, strongest first, skipping anything RDKit refuses."""
+    """Rows -> drawable cards, in the order given, skipping what RDKit refuses."""
     cards: list[Card] = []
     for _, row in frame.iterrows():
         if len(cards) >= top:
@@ -110,7 +152,13 @@ def build_cards(frame: pd.DataFrame, rank_col: str, top: int, prepare=None) -> l
             stats.append((rank_label(rank_col), _fmt(row[rank_col], 3)))
         stats.append(("Enamine compounds", _fmt(row["n_catalogue"])))
         title = str(row["combo_key"] if "combo_key" in row else row["frag_name"])
-        cards.append(Card(title, mol, stats))
+        cards.append(Card(title, mol, stats,
+                          cluster_id=int(row.get("cluster_id", 0)),
+                          cluster_size=int(row.get("cluster_size", 1))))
+    # A cluster can be cut by --top; report the size actually drawn.
+    drawn = Counter(card.cluster_id for card in cards)
+    for card in cards:
+        card.cluster_size = drawn[card.cluster_id]
     return cards
 
 
@@ -132,6 +180,8 @@ def _html_cards(cards: list[Card]) -> str:
             f'<div class="k">{html.escape(k)}</div><div class="v">{html.escape(v)}</div>'
             for k, v in card.stats
         )
+        # Members of a cluster are adjacent, which is the whole point; labelling
+        # each card with its cluster only added noise and overflowed the cell.
         out.append(f'<figure class="card"><div class="struct">{_svg(card.mol)}</div>'
                    f'<figcaption><div class="name">{html.escape(card.title)}</div>'
                    f'<div class="stats">{stats}</div></figcaption></figure>')
@@ -224,8 +274,7 @@ TEMPLATE = """<!doctype html>
 <div class="grid">{combination_cards}</div>
 
 <h2>Chemical space</h2>
-<p class="note">ECFP4 (radius 2, 2048 bits), PCA fitted on the background only, UMAP on Jaccard
-distance. Click a map to open it full size.</p>
+<p class="note">{space_caption} Click a map to open it full size.</p>
 {fragment_map}
 {combination_map}
 
@@ -251,6 +300,7 @@ def _card_png(mol: Chem.Mol, width: int = 520, height: int = 260) -> bytes:
 def _pdf_section(pdf, cards: list[Card], heading: str, caption: str) -> None:
     import matplotlib.image as mpimg
     import matplotlib.pyplot as plt
+    from textwrap import fill
 
     per_page = COLUMNS * PDF_ROWS
     pages = max(1, -(-len(cards) // per_page))
@@ -259,8 +309,8 @@ def _pdf_section(pdf, cards: list[Card], heading: str, caption: str) -> None:
         fig = plt.figure(figsize=(11.69, 8.27), facecolor="white")  # A4 landscape
         fig.text(0.04, 0.955, heading + (f" ({page + 1}/{pages})" if pages > 1 else ""),
                  fontsize=14, color=INK, weight="semibold")
-        fig.text(0.04, 0.925, caption, fontsize=8.5, color=INK_2)
-        top, bottom, left, right = 0.895, 0.03, 0.04, 0.985
+        fig.text(0.04, 0.932, fill(caption, 170), fontsize=8, color=INK_2, va="top")
+        top, bottom, left, right = 0.878, 0.03, 0.04, 0.985
         cell_w = (right - left) / COLUMNS
         cell_h = (top - bottom) / PDF_ROWS
         # Draw the structure at the panel's own aspect ratio, so RDKit fills the
@@ -360,6 +410,9 @@ def main() -> None:
                         help="stage 8 output (default: <results-dir>/embedding)")
     parser.add_argument("--out", type=Path, default=None, help="default: <catalogue-dir>/report.html")
     parser.add_argument("--top", type=int, default=60, help="structures drawn per panel")
+    parser.add_argument("--cluster-mode", choices=("none",) + MODES, default="series",
+                        help="normalisation grouping near-identical units side by side; "
+                             "clusters are ordered by their best member (default: %(default)s)")
     parser.add_argument("--min-enrichment", type=float, default=None,
                         help="only draw units scoring at least this on the ranking stage 7 used "
                              "(binders per non-binder, or the enrichment lower bound)")
@@ -389,14 +442,20 @@ def main() -> None:
                  f"{args.min_enrichment:g}: {len(frag_in):,} of {n_frag_all:,} fragments and "
                  f"{len(combo_in):,} of {n_combo_all:,} pairs.")
 
+    frag_in = order_by_cluster(frag_in, frag_rank, args.cluster_mode)
+    combo_in = order_by_cluster(combo_in, combo_rank, args.cluster_mode)
     frag_cards = build_cards(frag_in, frag_rank, args.top)
     combo_cards = build_cards(combo_in, combo_rank, args.top, prepare=_load_joiner())
 
-    frag_caption = (f"{len(frag_cards)} of {len(frag_in):,}, strongest first. A [16*] dummy marks an "
-                    f"attachment point: the match is the same fragment attached through the same chemistry.")
-    combo_caption = (f"{len(combo_cards)} of {len(combo_in):,}, strongest first. Each pair is drawn "
-                     f"re-bonded into one molecule; the remaining dummies are where the pair attached "
-                     f"to the rest of the compound.")
+    grouped = ("" if args.cluster_mode == "none" else
+               " Near-identical units are drawn next to each other, their group placed by its "
+               "strongest member.")
+    frag_caption = (f"{len(frag_cards)} of {len(frag_in):,}, strongest first.{grouped} A [16*] dummy "
+                    f"marks an attachment point: the match is the same fragment attached through the "
+                    f"same chemistry.")
+    combo_caption = (f"{len(combo_cards)} of {len(combo_in):,}, strongest first.{grouped} Each pair is "
+                     f"drawn re-bonded into one molecule; the remaining dummies are where the pair "
+                     f"attached to the rest of the compound.")
 
     files = [p for p in sorted(cat_dir.iterdir()) if p.is_file() and p.suffix in (".csv", ".parquet")]
     rows = "".join(
@@ -411,7 +470,20 @@ def main() -> None:
     title = f"DEL fragments found in {args.catalogue_name}"
     subtitle_html = (f"BRICS fragments and contiguous fragment pairs enriched in DEL binders, matched by "
                      f"content-hashed fragment id against {args.catalogue_name}. Scored on {scoring_html}.")
+    emb = emb_dir / "summary_embedding.json"
+    if emb.exists():
+        meta = json.loads(emb.read_text())
+        pca = ("physicochemical descriptors" if meta.get("pca_space") == "descriptors"
+               else f"the ECFP4 bits")
+        space_caption = (f"PCA on {pca}, fitted on the background only; UMAP on ECFP4 "
+                         f"(radius 2, {meta.get('n_bits', 1024)} bits) with Jaccard distance. "
+                         f"Background: {meta.get('n_background', 0):,} sampled per library, every "
+                         f"enriched unit drawn on top.")
+    else:
+        space_caption = "PCA fitted on the background only; UMAP on ECFP4 with Jaccard distance."
+
     page = TEMPLATE.format(
+        space_caption=html.escape(space_caption),
         title=title, subtitle=subtitle_html, columns=COLUMNS,
         tiles=_stat_tiles(summary, ratio, shown),
         frag_caption=html.escape(frag_caption).replace("[16*]", "<code>[16*]</code>"),

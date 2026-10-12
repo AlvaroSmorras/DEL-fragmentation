@@ -19,7 +19,17 @@ from rdkit.Chem import BRICS
 
 RDLogger.DisableLog("rdApp.*")
 
-DEFAULT_MIN_HAC = 6
+# Five, not six: a five-membered ring is exactly five heavy atoms, so at a floor
+# of six no thiophene, furan, thiazole, pyrazole, cyclopentane or THF attached by
+# a single BRICS bond can ever be detached.  35% of all candidate cuts in the
+# Enamine catalogue leave exactly five atoms on the smaller side - the floor was
+# sitting one atom above the commonest detachable group.  See
+# fragmentation_test/README.md.
+DEFAULT_MIN_HAC = 5
+
+# "balanced" maximises the number of fragments subject to the floor; "greedy" is
+# the original rule, kept so earlier runs can be reproduced exactly.
+DEFAULT_SELECTOR = "balanced"
 
 # Width of the content-derived fragment id.  A 64-bit digest collides with
 # probability ~2e-6 across 9M fragments, which is the scale a 300M-compound
@@ -101,8 +111,18 @@ def _components(n_atoms: int, bonds: Sequence[tuple[int, int, int]], cut: set[in
     return [uf.find(i) for i in range(n_atoms)]
 
 
-def _select_cuts(mol: Chem.Mol, bonds, min_hac: int) -> set[int]:
+def _select_cuts_greedy(mol: Chem.Mol, bonds, min_hac: int) -> set[int]:
     """Drop cuts until no fragment is smaller than ``min_hac`` heavy atoms.
+
+    .. warning::
+       Superseded by :func:`_select_cuts_balanced`, and kept only to reproduce
+       runs made before that existed.  This starts from the fully cut molecule
+       and only ever merges, so it needs some fragment to already be at the floor
+       to merge into.  Where candidate cuts are dense there is none - 100% of the
+       molecules it wrongly returned whole began with every piece under the floor
+       - and merging smallest into smallest keeps them all under it, so the
+       cascade runs until one fragment is left.  On the Enamine catalogue that
+       produced 9.3M whole molecules, 40% of the fragment dictionary.
 
     The smallest offending fragment is repeatedly merged into its smallest
     neighbour, which keeps the surviving fragments as evenly sized as possible
@@ -144,10 +164,106 @@ def _select_cuts(mol: Chem.Mol, bonds, min_hac: int) -> set[int]:
     return {b for b in cut if root_of[bond_atoms[b][0]] != root_of[bond_atoms[b][1]]}
 
 
-def fragment_mol(mol: Chem.Mol, min_hac: int = DEFAULT_MIN_HAC) -> Fragmentation:
+def _select_cuts_balanced(mol: Chem.Mol, bonds, min_hac: int) -> set[int]:
+    """Choose cuts to maximise the number of fragments, subject to the size floor.
+
+    Cutting every candidate bond leaves a tree of micro fragments, and the job
+    becomes: partition that tree into connected parts of at least ``min_hac``
+    atoms, as many parts as possible.  A post-order sweep that closes a part off
+    as soon as it is large enough is optimal for that, because holding on to
+    atoms past the floor can only ever starve a later part.
+
+    Unlike :func:`_select_cuts_greedy` this never needs a fragment that already
+    clears the floor to work from, which is exactly the situation the greedy rule
+    cannot handle.  Measured on 6,000 molecules the greedy rule returned whole,
+    it recovers every one that could be split at all.
+    """
+    if not bonds:
+        return set()
+
+    n_atoms = mol.GetNumAtoms()
+    candidates = {bond_idx for bond_idx, _, _ in bonds}
+
+    # Micro fragments: what survives when every candidate bond is cut at once.
+    uf = _UnionFind(n_atoms)
+    for bond in mol.GetBonds():
+        if bond.GetIdx() not in candidates:
+            uf.union(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+
+    node_of: dict[int, int] = {}
+    size: list[int] = []
+    for atom in range(n_atoms):
+        root = uf.find(atom)
+        if root not in node_of:
+            node_of[root] = len(size)
+            size.append(0)
+        size[node_of[root]] += 1
+
+    adjacency: dict[int, list[tuple[int, int]]] = {node: [] for node in range(len(size))}
+    for bond_idx, (atom_a, atom_b), _ in bonds:
+        node_a, node_b = node_of[uf.find(atom_a)], node_of[uf.find(atom_b)]
+        if node_a != node_b:            # a cut inside a ring joins a node to itself
+            adjacency[node_a].append((node_b, bond_idx))
+            adjacency[node_b].append((node_a, bond_idx))
+
+    # Pre-order walk, iterative so a long molecule cannot exhaust the stack.
+    # Reversing it gives a post-order: a parent always precedes its children.
+    order, seen, edge_to_parent = [], {0}, {0: None}
+    stack = [0]
+    while stack:
+        node = stack.pop()
+        order.append(node)
+        for neighbour, bond_idx in adjacency[node]:
+            if neighbour not in seen:
+                seen.add(neighbour)
+                edge_to_parent[neighbour] = bond_idx
+                stack.append(neighbour)
+
+    carried = list(size)
+    cut: set[int] = set()
+    for node in reversed(order[1:]):
+        if carried[node] >= min_hac:
+            cut.add(edge_to_parent[node])
+        else:
+            for neighbour, bond_idx in adjacency[node]:
+                if bond_idx == edge_to_parent[node]:
+                    carried[neighbour] += carried[node]
+                    break
+
+    # What is left around the root has to go somewhere.  Under the floor it joins
+    # a finished part, which gives up one cut but costs no parts; the cut given up
+    # has to sit on that leftover component's own boundary, so the component is
+    # walked out through the edges that survived.
+    if carried[order[0]] < min_hac and cut:
+        boundary, visited, stack = [], {order[0]}, [order[0]]
+        while stack:
+            node = stack.pop()
+            for neighbour, bond_idx in adjacency[node]:
+                if bond_idx in cut:
+                    boundary.append(bond_idx)
+                elif neighbour not in visited:
+                    visited.add(neighbour)
+                    stack.append(neighbour)
+        if boundary:
+            cut.discard(min(boundary))
+    return cut
+
+
+def _select_cuts(mol: Chem.Mol, bonds, min_hac: int,
+                 selector: str = DEFAULT_SELECTOR) -> set[int]:
+    """Pick the surviving cuts with ``selector``'s rule."""
+    if selector == "balanced":
+        return _select_cuts_balanced(mol, bonds, min_hac)
+    if selector == "greedy":
+        return _select_cuts_greedy(mol, bonds, min_hac)
+    raise ValueError(f"unknown selector {selector!r}, expected 'balanced' or 'greedy'")
+
+
+def fragment_mol(mol: Chem.Mol, min_hac: int = DEFAULT_MIN_HAC,
+                 selector: str = DEFAULT_SELECTOR) -> Fragmentation:
     """Decompose ``mol`` into BRICS fragments of at least ``min_hac`` heavy atoms."""
     bonds = _brics_bonds(mol)
-    cut = _select_cuts(mol, bonds, min_hac) if bonds else set()
+    cut = _select_cuts(mol, bonds, min_hac, selector) if bonds else set()
 
     if not cut:
         smiles = Chem.MolToSmiles(mol)
@@ -202,12 +318,13 @@ def fragment_mol(mol: Chem.Mol, min_hac: int = DEFAULT_MIN_HAC) -> Fragmentation
     )
 
 
-def fragment_smiles(smiles: str, min_hac: int = DEFAULT_MIN_HAC) -> Fragmentation | None:
+def fragment_smiles(smiles: str, min_hac: int = DEFAULT_MIN_HAC,
+                    selector: str = DEFAULT_SELECTOR) -> Fragmentation | None:
     """Fragment a SMILES string, returning ``None`` when RDKit cannot parse it."""
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
-    return fragment_mol(mol, min_hac=min_hac)
+    return fragment_mol(mol, min_hac=min_hac, selector=selector)
 
 
 def merge_fragments(

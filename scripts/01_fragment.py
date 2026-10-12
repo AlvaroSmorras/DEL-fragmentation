@@ -41,7 +41,9 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lib.aggregate import choose_buckets, group_sum, read_frames, total_rows  # noqa: E402
-from lib.fragmentation import DEFAULT_MIN_HAC, fragment_id, fragment_smiles  # noqa: E402
+from lib.fragmentation import (  # noqa: E402
+    DEFAULT_MIN_HAC, DEFAULT_SELECTOR, fragment_id, fragment_smiles,
+)
 from lib.io_utils import (  # noqa: E402
     add_project_root_to_path, input_files, progress, read_summary, write_summary,
 )
@@ -63,6 +65,7 @@ def _fragment_file(path_str: str) -> dict:
     """Fragment one input parquet.  One input file is one stratum."""
     path = Path(path_str)
     min_hac = _OPTS["min_hac"]
+    selector = _OPTS["selector"]
     out_dir = Path(_OPTS["out_dir"])
     counts_dir = Path(_OPTS["counts_dir"])
 
@@ -94,7 +97,7 @@ def _fragment_file(path_str: str) -> dict:
     for cid, smi, act in zip(ids, smiles, activities):
         cached = cache.get(smi, False) if use_cache else False
         if cached is False:
-            frag = fragment_smiles(smi, min_hac=min_hac)
+            frag = fragment_smiles(smi, min_hac=min_hac, selector=selector)
             if frag is None:
                 cached = None
             else:
@@ -279,7 +282,13 @@ def main() -> None:
     parser.add_argument("--pattern", default="*.parquet")
     parser.add_argument("--work-dir", type=Path, default=Path("work"))
     parser.add_argument("--min-hac", type=int, default=DEFAULT_MIN_HAC,
-                        help="minimum heavy atoms per fragment (default: %(default)s)")
+                        help="minimum heavy atoms per fragment (default: %(default)s). "
+                             "A five-membered ring is exactly 5 heavy atoms, so a floor of "
+                             "6 makes every one of them undetachable")
+    parser.add_argument("--selector", choices=("balanced", "greedy"), default=DEFAULT_SELECTOR,
+                        help="how the size floor decides which cuts survive. 'balanced' "
+                             "maximises the fragment count; 'greedy' is the older rule, which "
+                             "left 40%% of the Enamine dictionary uncut (default: %(default)s)")
     parser.add_argument("--workers", type=int, default=max(1, mp.cpu_count() - 1))
     parser.add_argument("--limit", type=int, default=0, help="only process the first N files (for testing)")
     parser.add_argument("--no-smiles-cache", action="store_true",
@@ -333,13 +342,13 @@ def main() -> None:
             if not files:
                 print("nothing left to fragment")
 
-        opts = {"min_hac": args.min_hac, "out_dir": str(out_dir),
+        opts = {"min_hac": args.min_hac, "selector": args.selector, "out_dir": str(out_dir),
                 "counts_dir": str(counts_dir), "stats_dir": str(stats_dir),
                 "cache_smiles": not args.no_smiles_cache}
         label = f"shard {shard[0]}/{shard[1]}: " if shard else ""
         if files:
             print(f"{label}fragmenting {len(files)} file(s) with {args.workers} worker(s), "
-                  f"min_hac={args.min_hac}")
+                  f"min_hac={args.min_hac}, selector={args.selector}")
             with mp.Pool(args.workers, initializer=_init_worker, initargs=(opts,)) as pool:
                 stream = pool.imap_unordered(_fragment_file, [str(f) for f in files])
                 for result in progress(stream, len(files), "fragment"):
@@ -350,6 +359,7 @@ def main() -> None:
         shard_dir.mkdir(parents=True, exist_ok=True)
         write_summary(shard_dir / f"shard{shard[0]:04d}.json", {
             "shard": shard[0], "n_shards": shard[1], "min_hac": args.min_hac,
+            "selector": args.selector,
             "n_files": len(files), "n_compounds": n_processed,
             "elapsed_s": round(time.time() - started, 1),
         })
@@ -373,6 +383,7 @@ def main() -> None:
 
     summary = {
         "min_hac": args.min_hac,
+        "selector": args.selector,
         "labelled": labelled,
         "input_dir": str(args.input_dir),
         "n_files": n_input_files,

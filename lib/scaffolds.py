@@ -22,11 +22,16 @@ from rdkit.Chem.Scaffolds import MurckoScaffold
 
 RDLogger.DisableLog("rdApp.*")
 
-MODES = ("exact", "substituent", "murcko", "generic")
+MODES = ("exact", "substituent", "series", "murcko", "generic")
 DEFAULT_MODE = "substituent"
 # Removing more than this many atoms from one fragment stops being a decoration
 # change, so such a fragment keeps its exact identity instead.
 DEFAULT_MAX_STRIP = 2
+# ``series`` peels a whole alkyl chain rather than one methyl, so it needs a
+# larger budget: isobutyl alone is four atoms.  Four, not more, so that a
+# penta-substituted ring still keeps its exact identity rather than dissolving
+# into the bare ring.
+DEFAULT_SERIES_MAX_STRIP = 4
 
 _STRIPPABLE = {6, 9, 17, 35, 53}  # carbon (methyl) and the halogens
 
@@ -76,12 +81,37 @@ def _strip_decorations(mol: Chem.Mol) -> tuple[Chem.Mol, int]:
     return editable.GetMol(), len(doomed)
 
 
+def default_max_strip(mode: str) -> int:
+    """The atom budget a mode wants when the caller does not set one."""
+    return DEFAULT_SERIES_MAX_STRIP if mode == "series" else DEFAULT_MAX_STRIP
+
+
+def _strip_to_fixed_point(mol: Chem.Mol, max_strip: int) -> tuple[Chem.Mol | None, int]:
+    """Strip until no terminal methyl or halogen is left.
+
+    One pass is not idempotent: it maps ethyl to methyl and methyl to hydrogen,
+    so two members of the same alkyl series land one step apart and never meet.
+    Iterating to a fixed point sends the whole series to one key.
+    """
+    removed_total = 0
+    while True:
+        stripped, removed = _strip_decorations(mol)
+        if removed == 0:
+            return mol, removed_total
+        removed_total += removed
+        if removed_total > max_strip:
+            return None, removed_total
+        mol = stripped
+
+
 def scaffold_key(
-    frag_smiles: str, mode: str = DEFAULT_MODE, max_strip: int = DEFAULT_MAX_STRIP
+    frag_smiles: str, mode: str = DEFAULT_MODE, max_strip: int | None = None
 ) -> str:
     """The key a fragment clusters under.  Falls back to its own SMILES."""
     if mode == "exact":
         return frag_smiles
+    if max_strip is None:
+        max_strip = default_max_strip(mode)
     mol = _prepared(frag_smiles)
     if mol is None:
         return frag_smiles
@@ -90,6 +120,11 @@ def scaffold_key(
         if mode == "substituent":
             stripped, removed = _strip_decorations(mol)
             if removed > max_strip:
+                return frag_smiles
+            return Chem.MolToSmiles(stripped)
+        if mode == "series":
+            stripped, _ = _strip_to_fixed_point(mol, max_strip)
+            if stripped is None:
                 return frag_smiles
             return Chem.MolToSmiles(stripped)
         if mode == "murcko":
@@ -103,6 +138,6 @@ def scaffold_key(
 
 
 def scaffold_keys(
-    frag_smiles: list[str], mode: str = DEFAULT_MODE, max_strip: int = DEFAULT_MAX_STRIP
+    frag_smiles: list[str], mode: str = DEFAULT_MODE, max_strip: int | None = None
 ) -> list[str]:
     return [scaffold_key(smi, mode, max_strip) for smi in frag_smiles]

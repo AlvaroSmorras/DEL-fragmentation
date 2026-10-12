@@ -38,10 +38,18 @@ If RDKit lives in a different interpreter from the one on `PATH`, set
 
 RDKit's BRICS cuts every retrosynthetic bond it can find, which leaves a lot of
 two-atom linkers. Cuts are therefore **undone** until every fragment holds at
-least `--min-hac` heavy atoms: the smallest offending fragment is repeatedly
-merged into its smallest neighbour, so fragments stay evenly sized instead of
-one of them growing into a blob. With `--min-hac 1` the output is identical to
+least `--min-hac` heavy atoms. Which cuts survive is `--selector`'s decision:
+`balanced` (default) keeps as many fragments as the floor allows, by sweeping the
+tree of candidate pieces and closing a fragment off as soon as it is large
+enough. With `--min-hac 1` the output is identical to
 `rdkit.Chem.BRICS.BreakBRICSBonds` (enforced by a test).
+
+`--selector greedy` is the older rule — merge the smallest offending fragment
+into its smallest neighbour — kept so runs made before 2026-10 can be reproduced.
+It starts from the fully cut molecule and only merges, so it needs a fragment
+already at the floor to merge into; where cut sites are dense there is none, and
+it collapses the molecule back to one piece. That left 9.3M Enamine compounds
+uncut, 40% of that library's fragment dictionary. See `fragmentation_test/`.
 
 Fragment SMILES keep their BRICS attachment labels (`[16*]c1ccccc1`), so the
 same ring joined through different chemistry stays a different fragment.
@@ -134,15 +142,28 @@ similarity threshold: keys need no all-against-all matrix (hopeless at millions
 of combinations) and give groups that do not depend on the order clustering ran
 in.
 
-`--mode substituent` (the default) strips terminal methyls and halogens. Three
-things are deliberately protected, each with a test:
+`--mode substituent` (the default) strips terminal methyls and halogens **once**,
+which is not idempotent: it maps ethyl to methyl and methyl to hydrogen, so two
+members of one alkyl series land a step apart and never meet. On the HGODEL run
+that split five 3-aminopyrazoles differing only in their 5-alkyl - together 37%
+of all binders - across three clusters. `--mode series` strips to a fixed point
+instead, so the whole series shares a key; its budget is 4 atoms rather than 2
+(isobutyl alone is 4), still small enough that a penta-substituted ring keeps
+its exact identity. It leaves attachment chemistry alone: the same pyrazole
+bonded through its nitrogen or through a ring carbon stays two keys.
+
+`substituent` is still the default so existing runs stay reproducible; check a
+change with stage 6 rather than by eye.
+
+Both stripping modes protect the same three things, each with a test:
 
 - **heteroatom substituents stay** — stripping the NH2 off a primary sulfonamide
   would discard the group that binds;
 - **stereocentres stay** — peeling the methyl off `[C@@H](C)` would silently
   erase the chirality;
-- **`--max-strip` caps it** (default 2), so a fragment that would lose more than
-  that keeps its exact identity rather than dissolving into a bare ring.
+- **`--max-strip` caps it** (default 2, or 4 for `series`), so a fragment that
+  would lose more than that keeps its exact identity rather than dissolving
+  into a bare ring.
 
 Cluster counts are **recounted from the per-compound table**, not summed from
 the members, since a compound carrying two members of a cluster must still count
@@ -227,9 +248,35 @@ to `results_full/catalogue/`:
 | `catalogue_compounds_enriched_combinations.parquet` | **every** catalogue compound carrying an enriched combination, with SMILES and the combination's DEL statistics |
 | `catalogue_compounds_enriched_fragments.parquet` | up to `--max-per-fragment` catalogue compounds per enriched fragment, spread over files (`--max-per-fragment 0` keeps every one); exact counts are in `fragment_in_catalogue.parquet` |
 | `enamine_compounds_with_enriched_fragment.{parquet,csv}`, `enamine_compounds_with_enriched_combination.{parquet,csv}` | the buying list: compound id, compound SMILES, the unit and its SMILES, then the DEL evidence. The CSV is skipped above 5M rows; the parquet always holds every row |
+| `enriched_fragment_analogues_in_catalogue.csv` | catalogue fragments that normalise to the same scaffold key as an enriched one (`--analogue-mode`, default `series`), each row naming its parent and carrying the parent's DEL evidence |
 
 Re-thresholding needs no rerun of the compound pass if you only tighten: filter
 the compound tables on their `enrichment_*_lo95` / `q_value*` columns.
+
+**Analogues.** An exact id match wants the same atoms and the same attachment,
+which is strict on a decorated series: the five 3-aminopyrazoles above matched
+1, 1, 76, 1 and 294 Enamine compounds each, though Enamine stocks the chemotype
+in quantity. `--analogue-mode series` (the default) therefore also writes the
+catalogue fragments sharing a parent's scaffold key, as a **separate table that
+is never merged into the exact counts**. Keeping them apart is the point: the
+DEL spreads that one series over a 37x range of binders per non-binder
+(ethyl 0.599, unsubstituted 0.016), so pooling would average away the SAR that
+says which member is worth buying. Each analogue row carries its parent and the
+parent's score, so a candidate is always read against the evidence behind it.
+
+Measured on the ratio run, analogues add 746 catalogue fragments across 35 of
+the 140 enriched fragments, and reach 7 that had no exact match at all. The
+gain is real but bounded, and the reason is worth knowing: of the 108 enriched
+fragments Enamine lacks, 81 carry an alkyne and are a median 20 heavy atoms
+against 11 for the matched ones. That is the DEL-only island in the stage 8
+UMAP - a chemotype the catalogue does not stock, which no amount of decoration
+stripping conjures. Looser keys do not help either: `--analogue-mode murcko`
+reaches 70 of 140 but matches on ring skeleton alone, 64 billion
+fragment-compound pairs, which is a different compound rather than an analogue.
+
+Analogue *compounds* are only listed with `--analogue-compounds`, since the
+analogue set reaches far more catalogue compounds than the exact one; those rows
+carry `match_type` and their parent fragment.
 
 **Stage 8** samples 500k distinct fragments (and 500k distinct contiguous pairs,
 enumerated from compounds drawn across 60 files) per library, adds every
@@ -357,8 +404,14 @@ floor, not a ranking.
 
 ## Tuning
 
-- `--min-hac` (default 6) is the main chemistry knob. Larger fragments are more
-  specific but recur across fewer compounds, so statistics get thinner.
+- `--min-hac` (default 5) is the main chemistry knob. Larger fragments are more
+  specific but recur across fewer compounds, so statistics get thinner. The
+  default is 5 rather than 6 because a five-membered ring is exactly five heavy
+  atoms: at 6, no thiophene, furan, thiazole, pyrazole or cyclopentane joined by
+  a single BRICS bond can ever be detached, and 35% of all candidate cuts in the
+  Enamine catalogue leave exactly five atoms on the smaller side.
+- `--selector` (default `balanced`) decides which cuts the floor keeps. Use
+  `greedy` only to reproduce a run made before 2026-10.
 - `--min-binder` (default 1) controls output size; raise it on large libraries.
 - `--min-count` (default 5) sets the total-compound floor.
 - `--sizes 2,3` costs little in stage 2 but multiplies the number of

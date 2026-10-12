@@ -13,6 +13,9 @@ Outputs, under ``--out-dir``:
   every scored DEL fragment / combination with ``n_catalogue`` (catalogue
   compounds carrying it) and an ``enriched`` flag.
 * ``enriched_*_in_catalogue.csv`` - the enriched subset, sorted by the ranking.
+* ``enriched_fragment_analogues_in_catalogue.csv`` - catalogue fragments that are
+  not the enriched fragment but normalise to the same scaffold key, each row
+  naming its parent and carrying the parent's DEL evidence (``--analogue-mode``).
 * ``enamine_compounds_with_enriched_fragment.csv`` /
   ``enamine_compounds_with_enriched_combination.csv`` - one row per catalogue
   compound and unit: compound id, compound SMILES, the unit's name/key and its
@@ -42,6 +45,18 @@ files and can be resumed (``parts/`` keeps finished files).  Skip it with
   where the ``binder_per_nonbinder`` column comes from.  The library's own base
   rate is about 0.0005, so the default 0.01 is a 20x enrichment.
 
+**Analogues.** An exact id match needs the same atoms and the same BRICS
+attachment, which on a decorated series is strict: on the HGODEL run five
+3-aminopyrazoles differing only in their 5-alkyl matched 1, 1, 76, 1 and 294
+catalogue compounds, while the catalogue holds the chemotype in quantity.
+``--analogue-mode series`` (the default) also reports catalogue fragments
+sharing a parent's scaffold key, as a **separate, labelled** table - never
+merged into the exact counts, because the DEL itself spreads that same series
+over a 37x range of binders per non-binder, and pooling would average away the
+SAR that says which member to buy.  ``--analogue-mode none`` turns it off.
+Analogue *compounds* are only listed with ``--analogue-compounds``, since the
+analogue set reaches far more catalogue compounds than the exact one.
+
 Combinations are only present in the catalogue run for the target list it was
 built with (``scripts/build_target_combos.py``, every DEL pair with >= 1
 binder); every scored combination is in that list, so nothing is missed.
@@ -66,6 +81,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lib.combinations import combo_columns  # noqa: E402
+from lib.scaffolds import MODES, scaffold_key  # noqa: E402
 from lib.io_utils import add_project_root_to_path, progress, read_summary  # noqa: E402
 
 add_project_root_to_path()
@@ -153,6 +169,74 @@ def _process_file(name: str) -> tuple[str, int, int]:
     return name, len(combos), len(frags)
 
 
+def _key_worker(smiles: str) -> str:
+    return scaffold_key(smiles, _TASK["analogue_mode"])
+
+
+def find_analogues(args, enr_frag: pd.DataFrame) -> pd.DataFrame:
+    """Catalogue fragments sharing an enriched fragment's scaffold key.
+
+    The catalogue dictionary is the expensive side - 23M fragments on the
+    bundled Enamine run - but a key is one RDKit parse and a strip, so the pass
+    is about a minute across a node.
+    """
+    cat = pq.read_table(args.catalogue_work / "fragments.parquet",
+                        columns=["frag_id", "frag_name", "frag_smiles", "n_compounds"]).to_pandas()
+    print(f"analogues: keying {len(cat):,} catalogue fragments (mode={args.analogue_mode})")
+    with Pool(args.workers, initializer=_init, initargs=({"analogue_mode": args.analogue_mode},)) as pool:
+        cat["scaffold_key"] = pool.map(_key_worker, cat["frag_smiles"].tolist(), chunksize=2000)
+        parent_keys = pool.map(_key_worker, enr_frag["frag_smiles"].tolist(), chunksize=50)
+
+    parents = enr_frag.copy()
+    parents["scaffold_key"] = parent_keys
+    rank = "binder_per_nonbinder" if "binder_per_nonbinder" in parents.columns else "enrichment_factor_lo95"
+    parents = parents[["frag_name", "frag_smiles", "frag_id", "n_binder", "n_nonbinder",
+                       rank, "n_catalogue", "scaffold_key"]].rename(columns={
+        "frag_name": "parent_frag_name", "frag_smiles": "parent_frag_smiles",
+        "frag_id": "parent_frag_id", "n_binder": "parent_n_binder",
+        "n_nonbinder": "parent_n_nonbinder", rank: f"parent_{rank}",
+        "n_catalogue": "parent_n_catalogue_exact"})
+
+    hits = parents.merge(cat, on="scaffold_key", how="inner")
+    # The parent itself is an exact match, already in the main tables.
+    hits["match_type"] = np.where(hits["frag_id"] == hits["parent_frag_id"], "exact", "analogue")
+    hits = hits.rename(columns={"frag_id": "catalogue_frag_id",
+                                "frag_name": "catalogue_frag_name",
+                                "frag_smiles": "catalogue_frag_smiles",
+                                "n_compounds": "n_catalogue_compounds"})
+    hits = hits.sort_values([f"parent_{rank}", "n_catalogue_compounds"], ascending=False)
+    hits.to_csv(args.out_dir / "enriched_fragment_analogues_in_catalogue.csv", index=False)
+    return hits
+
+
+def _check_same_fragmentation(args) -> None:
+    """Refuse to join two libraries that were not fragmented the same way.
+
+    Fragment ids are content hashes, so a different ``--min-hac`` or
+    ``--selector`` gives the same chemistry a different id.  Joining across the
+    two does not fail - it silently matches almost nothing, which reads as "the
+    catalogue does not contain this chemistry" rather than as the mistake it is.
+    """
+    catalogue = read_summary(args.catalogue_work / "summary_fragment.json")
+    dele = read_summary(args.del_results / "summary_enrichment.json")
+    # Runs made before --selector existed were all greedy.
+    settings = {
+        "--min-hac": (dele.get("min_hac"), catalogue.get("min_hac")),
+        "--selector": (dele.get("selector", "greedy"), catalogue.get("selector", "greedy")),
+    }
+    differ = {k: v for k, v in settings.items() if None not in v and v[0] != v[1]}
+    if not differ:
+        return
+    detail = "; ".join(f"{k}: DEL {v[0]!r} vs catalogue {v[1]!r}" for k, v in differ.items())
+    message = (f"the DEL and the catalogue were fragmented with different settings ({detail}). "
+               f"Fragment ids would not be comparable and the overlap would come out near zero. "
+               f"Re-run stage 1 on both with the same settings")
+    if args.allow_settings_mismatch:
+        print(f"WARNING: {message}.", flush=True)
+        return
+    raise SystemExit(f"error: {message}, or pass --allow-settings-mismatch if this is deliberate.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--del-results", type=Path, default=Path("results_full"))
@@ -160,6 +244,9 @@ def main() -> None:
     parser.add_argument("--catalogue-input", type=Path, default=Path("data/Enamine_ll/sharded"))
     parser.add_argument("--out-dir", type=Path, default=Path("results_full/catalogue"))
     parser.add_argument("--size", type=int, default=2)
+    parser.add_argument("--allow-settings-mismatch", action="store_true",
+                        help="proceed even if the two libraries were fragmented with "
+                             "different --min-hac or --selector")
     parser.add_argument("--rank", choices=("mh", "ratio"), default="mh",
                         help="what counts as enriched (default: %(default)s)")
     parser.add_argument("--alpha", type=float, default=0.05, help="--rank mh: q-value cut")
@@ -170,6 +257,12 @@ def main() -> None:
                         help="--rank ratio: binder compounds required (default: %(default)s)")
     parser.add_argument("--min-lo95", type=float, default=1.0,
                         help="--rank mh: 95%% lower bound the enrichment must exceed")
+    parser.add_argument("--analogue-mode", choices=("none",) + MODES, default="series",
+                        help="normalisation deciding which catalogue fragments count as "
+                             "analogues of an enriched one (default: %(default)s)")
+    parser.add_argument("--analogue-compounds", action="store_true",
+                        help="also list catalogue compounds carrying an analogue, not just "
+                             "the analogue fragments themselves")
     parser.add_argument("--max-per-fragment", type=int, default=1000,
                         help="catalogue compounds kept per enriched fragment; 0 keeps every one "
                              "(default: %(default)s)")
@@ -177,6 +270,7 @@ def main() -> None:
     parser.add_argument("--no-compounds", action="store_true", help="count tables only")
     parser.add_argument("--limit-files", type=int, default=0, help="only the first N files (testing)")
     args = parser.parse_args()
+    _check_same_fragmentation(args)
     start = time.time()
     args.out_dir.mkdir(parents=True, exist_ok=True)
     keys = combo_columns(args.size)
@@ -219,8 +313,13 @@ def main() -> None:
             if c in enr_combo.columns]
     enr_combo[cols].to_csv(args.out_dir / "enriched_combinations_in_catalogue.csv", index=False)
 
+    analogues = pd.DataFrame()
+    if args.analogue_mode != "none" and len(enr_frag):
+        analogues = find_analogues(args, enr_frag)
+
     summary = {
         "rank": args.rank, "alpha": args.alpha, "min_lo95": args.min_lo95,
+        "analogue_mode": args.analogue_mode,
         "min_ratio": args.min_ratio, "min_binder": args.min_binder,
         "del_results": str(args.del_results),
         "fragments_scored": len(frag),
@@ -233,10 +332,21 @@ def main() -> None:
         "combinations_enriched_in_catalogue": int(enr_combo["in_catalogue"].sum()),
         "catalogue_compounds_with_enriched_combination_rows": int(enr_combo["n_catalogue"].sum()),
     }
+    if len(analogues):
+        extra = analogues[analogues["match_type"] == "analogue"]
+        summary["analogues"] = {
+            "catalogue_fragments": int(len(extra)),
+            "enriched_fragments_with_an_analogue": int(extra["parent_frag_name"].nunique()),
+            "enriched_fragments_reachable_only_by_analogue": int(
+                extra.loc[extra["parent_n_catalogue_exact"] == 0, "parent_frag_name"].nunique()),
+            # Summed over fragments, so a compound carrying two analogues counts
+            # twice: an upper bound on compounds, exact on fragment-compound pairs.
+            "catalogue_fragment_compound_pairs": int(extra["n_catalogue_compounds"].sum()),
+        }
     print(json.dumps(summary, indent=2))
 
     if not args.no_compounds:
-        catalogue_compounds(args, keys, enr_frag, enr_combo, summary)
+        catalogue_compounds(args, keys, enr_frag, enr_combo, summary, analogues)
 
     summary["elapsed_s"] = round(time.time() - start, 1)
     (args.out_dir / "summary_catalogue_hits.json").write_text(json.dumps(summary, indent=2) + "\n")
@@ -276,7 +386,7 @@ def _write_compound_table(hits: pd.DataFrame, stem: Path, unit_id: str, unit_smi
         print(f"wrote {stem.with_suffix('.parquet')} ({len(out):,} rows; too large for CSV)")
 
 
-def catalogue_compounds(args, keys, enr_frag, enr_combo, summary) -> None:
+def catalogue_compounds(args, keys, enr_frag, enr_combo, summary, analogues=None) -> None:
     parts_dir = args.out_dir / "parts"
     parts_dir.mkdir(exist_ok=True)
     combo_dir = args.catalogue_work / "combinations" / f"size{args.size}"
@@ -289,6 +399,10 @@ def catalogue_compounds(args, keys, enr_frag, enr_combo, summary) -> None:
 
     targets = enr_combo[enr_combo["in_catalogue"]][keys + ["combo_key"]].reset_index(drop=True)
     frag_ids = enr_frag.loc[enr_frag["in_catalogue"], "frag_id"].to_numpy(dtype="int64")
+    if args.analogue_compounds and analogues is not None and len(analogues):
+        extra = analogues.loc[analogues["match_type"] == "analogue", "catalogue_frag_id"]
+        frag_ids = np.unique(np.concatenate([frag_ids, extra.to_numpy(dtype="int64")]))
+        print(f"including {len(extra):,} analogue fragments in the compound pass")
     task = {
         "parts_dir": parts_dir, "keys": keys, "combo_dir": combo_dir,
         "frag_dir": args.catalogue_work / "compound_fragments",
@@ -326,6 +440,14 @@ def catalogue_compounds(args, keys, enr_frag, enr_combo, summary) -> None:
         frag_hits = frag_hits.sample(frac=1.0, random_state=0).groupby("frag_id", sort=False).head(
             args.max_per_fragment
         )
+    if args.analogue_compounds and analogues is not None and len(analogues):
+        # An analogue carries its parent's identity and score, never its own.
+        link = analogues[["catalogue_frag_id", "catalogue_frag_smiles", "match_type",
+                          "parent_frag_name", "parent_frag_smiles"]].drop_duplicates(
+            "catalogue_frag_id")
+        frag_hits = frag_hits.merge(link, left_on="frag_id", right_on="catalogue_frag_id",
+                                    how="left").drop(columns="catalogue_frag_id")
+        frag_hits["match_type"] = frag_hits["match_type"].fillna("exact")
     frag_hits = frag_hits.merge(
         enr_frag[[c for c in ("frag_id", "frag_name", "frag_smiles", "n_binder", "n_nonbinder",
                               "binder_per_nonbinder", "enrichment_factor", "enrichment_factor_lo95",

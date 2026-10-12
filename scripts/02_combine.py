@@ -217,6 +217,7 @@ def main() -> None:
         "n_target_combos": None if targets is None else len(targets),
         "sizes": list(sizes),
         "min_hac": stage1["min_hac"],
+        "selector": stage1.get("selector", "greedy"),
         "n_files": len(files),
         "long_table": long_root is not None,
         "elapsed_s": round(time.time() - started, 1),

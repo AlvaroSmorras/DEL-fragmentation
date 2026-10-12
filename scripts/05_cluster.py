@@ -43,7 +43,7 @@ from lib.enrichment import (  # noqa: E402
 )
 from lib.fragmentation import fragment_id  # noqa: E402
 from lib.io_utils import add_project_root_to_path, progress, read_summary, write_summary  # noqa: E402
-from lib.scaffolds import DEFAULT_MAX_STRIP, DEFAULT_MODE, MODES, scaffold_keys  # noqa: E402
+from lib.scaffolds import DEFAULT_MODE, MODES, default_max_strip, scaffold_keys  # noqa: E402
 
 add_project_root_to_path()
 
@@ -205,9 +205,9 @@ def main() -> None:
     parser.add_argument("--results-dir", type=Path, default=Path("results"))
     parser.add_argument("--mode", choices=MODES, default=DEFAULT_MODE,
                         help="how tightly fragments are normalised (default: %(default)s)")
-    parser.add_argument("--max-strip", type=int, default=DEFAULT_MAX_STRIP,
-                        help="atoms a fragment may lose before it keeps its exact "
-                             "identity instead (default: %(default)s)")
+    parser.add_argument("--max-strip", type=int, default=None,
+                        help="atoms a fragment may lose before it keeps its exact identity "
+                             "instead (default: 2, or 6 for --mode series)")
     parser.add_argument("--stratify", choices=("file", "none"), default="file")
     parser.add_argument("--alpha", type=float, default=DEFAULT_ALPHA)
     parser.add_argument("--approximate", action="store_true",
@@ -218,6 +218,8 @@ def main() -> None:
                              "value stage 3 was run with (default: %(default)s)")
     parser.add_argument("--top", type=int, default=500)
     args = parser.parse_args()
+    if args.max_strip is None:
+        args.max_strip = default_max_strip(args.mode)
 
     stage1 = read_summary(args.work_dir / "summary_fragment.json")
     stage2 = read_summary(args.work_dir / "summary_combine.json")

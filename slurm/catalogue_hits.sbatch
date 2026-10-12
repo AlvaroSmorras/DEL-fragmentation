@@ -25,4 +25,5 @@ python scripts/07_catalogue_hits.py \
     --alpha "${ALPHA:-0.05}" --min-lo95 "${MIN_LO95:-1}" \
     --min-ratio "${MIN_RATIO:-0.01}" --min-binder "${MIN_BINDER:-5}" \
     --max-per-fragment "${MAX_PER_FRAGMENT:-1000}" \
+    --analogue-mode "${ANALOGUE_MODE:-series}" ${ANALOGUE_COMPOUNDS:+--analogue-compounds} \
     --workers "$SLURM_CPUS_PER_TASK"
